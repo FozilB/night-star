@@ -2,7 +2,7 @@ name: Scan
 
 on:
   schedule:
-    - cron: "*/15 * * * *"        # каждые 15 минут (GitHub может запускать с задержкой в несколько минут)
+       - cron: "3,18,33,48 * * * *"        # каждые 15 минут (GitHub может запускать с задержкой в несколько минут)
   workflow_dispatch:
     inputs:
       test_telegram:
