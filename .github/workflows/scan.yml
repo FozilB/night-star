@@ -1,0 +1,54 @@
+name: Scan
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"        # каждые 15 минут (GitHub может запускать с задержкой в несколько минут)
+  workflow_dispatch:
+    inputs:
+      test_telegram:
+        description: "Только отправить тестовое сообщение в Telegram"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Пробный запуск: сообщения не отправлять, только показать текст в логе"
+        type: boolean
+        default: false
+
+concurrency:
+  group: scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Восстановить память бота (какие звёзды уже видели)
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+
+      - name: Запуск сканера
+        run: python scanner.py
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TEST_TELEGRAM: ${{ inputs.test_telegram && '1' || '' }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+
+      - name: Сохранить память бота
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: state-${{ github.run_id }}
