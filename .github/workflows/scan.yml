@@ -2,7 +2,7 @@ name: Scan
 
 on:
   schedule:
-       - cron: "3,18,33,48 * * * *"        # каждые 15 минут (GitHub может запускать с задержкой в несколько минут)
+    - cron: "3,18,33,48 * * * *"  # запасной вариант: GitHub запускает по расписанию редко и с опозданием, основной ход - цепочка ниже
   workflow_dispatch:
     inputs:
       test_telegram:
@@ -14,6 +14,11 @@ on:
         type: boolean
         default: false
 
+# actions: write нужен, чтобы запуск мог сам запустить следующий (цепочка запусков)
+permissions:
+  contents: read
+  actions: write
+
 concurrency:
   group: scan
   cancel-in-progress: false
@@ -21,7 +26,7 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
 
@@ -52,3 +57,21 @@ jobs:
         with:
           path: state
           key: state-${{ github.run_id }}
+
+      - name: Следующий запуск (цепочка)
+        # Ждём ближайшего момента через 2 минуты после закрытия свечи 15м (:02, :17, :32, :47)
+        # и запускаем следующий запуск сами. Тестовые и пробные запуски, а также отменённые вручную,
+        # цепочку не продолжают.
+        if: ${{ !cancelled() && !inputs.test_telegram && !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          now=$(date +%s)
+          next=$(( ( (now - 120 + 899) / 900 ) * 900 + 120 ))
+          wait=$(( next - now ))
+          echo "Жду ${wait} с до следующего запуска ($(date -d @${next} +%H:%M) UTC)"
+          sleep "$wait"
+          gh workflow run scan.yml --ref "${{ github.ref_name }}" \
+            && echo "Следующий запуск поставлен" \
+            || echo "Не удалось поставить следующий запуск (проверьте Settings -> Actions -> General -> Workflow permissions); сработает расписание"
