@@ -6,6 +6,9 @@
             как только одна из них закрылась ниже минимума звезды;
   свеча 3 - остатки движения: сообщений уже не будет.
 
+Если в настройках STAR_ALERT = True, сообщение «звезда найдена» приходит сразу при обнаружении звезды
+(не дожидаясь падения), а сообщение «падение началось» - вторым шагом.
+
 Порядок работы одного запуска (из-за паузы между запросами поиск новых звёзд долгий):
   1) сначала проверка уже найденных звёзд (срочно),
   2) потом поиск новых звёзд на 1ч/4ч (долго),
@@ -300,7 +303,73 @@ def build_message(w, c, bar, close_ts, ctx):
     return "\n".join(lines)
 
 
+def build_star_message(w, cur, now):
+    """Первое сообщение: звезда найдена, падение ещё не подтверждено."""
+    base = w["inst"].split("-")[0]
+    star_tf = TF_RU[w["tf"]]
+    level = level_of(w)
+    level_name = "минимума звезды" if C.CONFIRM_LEVEL == "low" else "низа тела звезды"
+    url = f"https://www.tradingview.com/chart/?symbol=OKX:{base}USDT.P&interval={TV_INTERVAL['15m']}"
+    end = w["ts"] + 2 * TF_MS[w["tf"]]
+    confirm_tfs = " или ".join(TF_RU[b] for b in C.CONFIRM_TIMEFRAMES)
+
+    lines = [
+        f"{C.EMOJI} <b>{C.TITLE}</b> · {base}/USDT",
+        "",
+        "Звезда найдена, падение ещё не началось.",
+        "",
+        f"Цена сейчас: {price(cur)} ({fmt_hm(now)}, Ташкент)",
+        f"Звезда: {star_tf}, закрылась {fmt_time(w['ts'] + TF_MS[w['tf']])}",
+    ]
+    if w.get("prev_mult") is not None:
+        lines.append(f"Перед звездой: зелёная свеча {star_tf}, тело ×{w['prev_mult']:.1f} от среднего, "
+                     f"тело звезды {w['star_vs_prev']:.0f}% от неё")
+    if w.get("rsi_star") is not None:
+        lines.append(f"RSI(14) на звезде {star_tf}: {rsi_text(w['rsi_star'])}")
+    if w.get("vol_mult"):
+        lines.append(f"Объём звезды: ×{w['vol_mult']:.1f} от среднего")
+
+    dist = (cur - level) / cur * 100
+    if cur < level:
+        where = "цена уже ниже, жду закрытия свечи"
+    else:
+        where = f"{-dist:+.1f}% от цены сейчас"
+    to_cancel = (w["h"] - cur) / cur * 100
+    lines += [
+        "",
+        f"Падение начнётся, если свеча {confirm_tfs} закроется ниже {level_name}:",
+        f"{price(level)} ({where})",
+        f"Слежу до {fmt_time(end)} (конец следующей свечи {star_tf})",
+        "",
+        f"Отмена сценария: закрытие выше {price(w['h'])} ({to_cancel:+.1f}% от цены сейчас)",
+        "",
+        f'<a href="{url}">График TradingView</a>',
+    ]
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------- Шаги работы
+
+def star_alert(state, key, cur, stats):
+    """Сообщение «звезда найдена». Не чаще одного на монету за COIN_COOLDOWN_HOURS."""
+    w = state["watch"].get(key)
+    if not w or w.get("star_alerted"):
+        return
+    now = now_ms()
+    cool = C.COIN_COOLDOWN_HOURS * 3_600_000
+    for store in ("last_star_alert", "last_alert"):
+        last = state[store].get(w["inst"])
+        if last and now - last < cool:
+            log(f"  {w['inst']}: по этой монете недавно уже было сообщение, звезду не объявляю")
+            return
+    if send(build_star_message(w, cur, now)):
+        state["last_star_alert"][w["inst"]] = now
+        w["star_alerted"] = True
+        stats["star_sent"] += 1
+        log(f"  ОТПРАВЛЕНО (звезда найдена): {w['inst']} {w['tf']}")
+    else:
+        stats["send_failed"] += 1
+
 
 def scan_new_stars(state, now, stats, new_keys):
     insts = None
@@ -309,6 +378,7 @@ def scan_new_stars(state, now, stats, new_keys):
             log(f"[{tf}] лимит времени запуска исчерпан, поиск продолжится в следующем запуске")
             return
         tf_ms = TF_MS[tf]
+        first_close = min(TF_MS[b] for b in C.CONFIRM_TIMEFRAMES)
         if state["scanned"].get(tf) == (now // tf_ms) * tf_ms - tf_ms:
             continue  # свеча этого ТФ уже проверена, лишний запрос не нужен
         ref = fetch_candles(REFERENCE, tf, 3)
@@ -361,6 +431,13 @@ def scan_new_stars(state, now, stats, new_keys):
             new_keys.add(key)
             found += 1
             log(f"  звезда: {inst} {tf}")
+            if getattr(C, "STAR_ALERT", True):
+                # цена сейчас - закрытие последней (формирующейся) свечи этого же запроса
+                cur = cs[-1]["c"]
+                if now_ms() >= ref_ts + tf_ms + first_close:
+                    # запуск опоздал: свечи 15м уже закрылись, падение могло начаться - сначала проверка
+                    check_watch(state, now_ms(), stats, only={key})
+                star_alert(state, key, cur, stats)
         stats["scanned"][tf] = done - failed
         stats["failed"] += failed
         stats["found"] += found
@@ -450,7 +527,7 @@ def main():
     state = load_state()
     now = now_ms()
     stats = {"scanned": {}, "failed": 0, "found": 0, "errors": 0, "expired": 0, "cancelled": 0,
-             "too_late": 0, "cooldown": 0, "sent": 0, "send_failed": 0}
+             "too_late": 0, "cooldown": 0, "sent": 0, "star_sent": 0, "send_failed": 0}
     new_keys = set()
     try:
         check_watch(state, now, stats)                      # 1) срочно: звёзды, найденные раньше
@@ -461,7 +538,8 @@ def main():
     finally:
         save_state(state)
     log(f"Итог: проверено монет {stats['scanned'] or 'новых свечей нет'}, ошибок запросов {stats['failed']}, "
-        f"новых звёзд {stats['found']}, на наблюдении {len(state['watch'])}, отправлено {stats['sent']}, "
+        f"новых звёзд {stats['found']} (объявлено {stats['star_sent']}), на наблюдении {len(state['watch'])}, "
+        f"падений отправлено {stats['sent']}, "
         f"отменено {stats['cancelled']}, не успели {stats['expired']}, слишком поздно {stats['too_late']}, "
         f"повтор по монете {stats['cooldown']}, время работы {(time.time() - T0) / 60:.1f} мин")
     if stats["send_failed"]:
@@ -474,7 +552,7 @@ def load_state():
             s = json.load(f)
     except (OSError, ValueError):
         s = {}
-    for k in ("scanned", "watch", "seen", "last_alert"):
+    for k in ("scanned", "watch", "seen", "last_alert", "last_star_alert"):
         s.setdefault(k, {})
     return s
 
@@ -488,6 +566,7 @@ def save_state(s):
 def prune(state, now):
     state["seen"] = {k: v for k, v in state["seen"].items() if now - v < 3 * DAY_MS}
     state["last_alert"] = {k: v for k, v in state["last_alert"].items() if now - v < 2 * DAY_MS}
+    state["last_star_alert"] = {k: v for k, v in state["last_star_alert"].items() if now - v < 2 * DAY_MS}
 
 
 if __name__ == "__main__":
